@@ -1,0 +1,2 @@
+{"step": 0, "role": "assistant", "content": "{\"response\":\"Hello! How can I assist you today?\"}", "tool_calls": []}
+{"step": "final", "answer": {"response": "Hello! How can I assist you today?"}}
