@@ -218,6 +218,9 @@ SYSTEM = textwrap.dedent("""
     - run_python is a SCRIPT, not a notebook. Always print() what you want
       to see. Large PDFs can take 60s+ to parse - extract only the pages
       you need.
+    - Each run_python call is a FRESH process. Variables do NOT persist
+      between calls. Re-read files and redefine everything you need in
+      every script.
 
     METHOD:
     - Start from the search results provided to you. Use web_search again
@@ -233,6 +236,11 @@ SYSTEM = textwrap.dedent("""
     - If you cannot find real data, still return a best-effort answer in
       the required shape, but first call run_python to print what you
       tried, so the log records your reasoning.
+    - Government tables often show several time periods across columns,
+      oldest first. Unless asked otherwise, use the MOST RECENT period -
+      never the max across all periods.
+    - If a document states the answer in prose, trust that over your own
+      table parsing.
 
     Output only the answer value. No prose, no markdown fences.
 """).strip()
