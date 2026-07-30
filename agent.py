@@ -182,6 +182,7 @@ SYSTEM = textwrap.dedent("""
 
 
 def solve(history: list, run_id: str):
+
     _seen.clear()
     log = []
     question = history[-1]["content"]
@@ -195,6 +196,14 @@ def solve(history: list, run_id: str):
                              "Use these before inventing URLs."}])
 
     m = None
+
+    dead_search = hits.startswith("ERROR")
+    if dead_search:
+        messages.append({"role": "user", "content":
+            "NOTE: web search is unavailable. Do not call web_search. "
+            "Go directly to fetch_url on likely data URLs, or answer from "
+            "your own knowledge if no data is reachable."})
+    
     for i in range(MAX_STEPS):
         r = client.chat.completions.create(
             model=MODEL, messages=messages, tools=TOOLS, temperature=0)
@@ -234,7 +243,8 @@ def solve(history: list, run_id: str):
     except Exception:
         answer = raw
 
-    if isinstance(answer, dict) and "log_url" in answer and "answer" in answer:
+    while (isinstance(answer, dict) and "answer" in answer
+       and set(answer.keys()) <= {"answer", "log_url"}):
         answer = answer["answer"]
 
     log.append({"step": "final", "answer": answer})
@@ -243,3 +253,5 @@ def solve(history: list, run_id: str):
     except Exception as e:
         log.append({"commit_error": str(e)})
     return answer
+
+
