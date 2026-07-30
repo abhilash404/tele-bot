@@ -63,20 +63,30 @@ def fetch_url(url: str) -> str:
     _seen[url] = out
     return out
 
+TAVILY_KEY = os.environ.get("TAVILY_KEY", "")
 
 def web_search(query: str) -> str:
+    if TAVILY_KEY:
+        try:
+            r = httpx.post("https://api.tavily.com/search", timeout=30, json={
+                "api_key": TAVILY_KEY, "query": query,
+                "max_results": 8, "search_depth": "basic"})
+            data = r.json()
+            rows = [f"{x.get('title','')} | {x.get('url','')} | "
+                    f"{(x.get('content') or '')[:300]}"
+                    for x in data.get("results", [])]
+            if rows:
+                return "\n".join(rows)
+        except Exception as e:
+            return f"ERROR (tavily): {e}"
+
+    # fallback: DDG lite - often blocked from cloud IPs
     try:
-        r = httpx.post("https://html.duckduckgo.com/html/",
-                       data={"q": query}, timeout=30,
-                       headers={"User-Agent": "Mozilla/5.0"})
+        r = httpx.post("https://lite.duckduckgo.com/lite/", data={"q": query},
+                       timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         soup = BeautifulSoup(r.text, "lxml")
-        rows = []
-        for res in soup.select(".result")[:8]:
-            a = res.select_one(".result__a")
-            s = res.select_one(".result__snippet")
-            if a:
-                rows.append(f"{a.get_text(strip=True)} | {a.get('href')} | "
-                            f"{s.get_text(strip=True) if s else ''}")
+        rows = [f"{a.get_text(strip=True)} | {a.get('href')}"
+                for a in soup.select("a.result-link")[:8]]
         return "\n".join(rows) or "No results."
     except Exception as e:
         return f"ERROR: {e}"
