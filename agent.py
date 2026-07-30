@@ -1,6 +1,7 @@
-import os, json, base64, subprocess, tempfile, textwrap
+import os, io, json, base64, subprocess, tempfile, textwrap, pathlib
 import httpx
 from bs4 import BeautifulSoup
+from pypdf import PdfReader
 from openai import OpenAI
 
 client = OpenAI(
@@ -10,10 +11,14 @@ client = OpenAI(
 MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 
 GH_TOKEN = os.environ["GH_TOKEN"]
+TAVILY_KEY = os.environ.get("TAVILY_KEY", "")
 REPO = "abhilash404/tele-bot"
 
 MAX_TOOL_CHARS = 6000
 MAX_STEPS = 8
+
+WORKDIR = pathlib.Path("/tmp/work")
+WORKDIR.mkdir(parents=True, exist_ok=True)
 
 _seen = {}
 
@@ -40,12 +45,46 @@ def fetch_url(url: str) -> str:
             return out
 
     ctype = r.headers.get("content-type", "").lower()
+    body = r.content
+    name = (url.split("/")[-1].split("?")[0] or "file")[:80]
+    saved = WORKDIR / name
+    try:
+        saved.write_bytes(body)
+    except Exception:
+        saved = None
 
-    if "html" not in ctype:
-        out = r.text[:8000]                 # csv / json / xml / plain
+    # --- PDF ---
+    if body[:4] == b"%PDF" or "pdf" in ctype:
+        try:
+            reader = PdfReader(io.BytesIO(body))
+            text = "\n".join((p.extract_text() or "") for p in reader.pages)
+            out = (f"[PDF saved to {saved} - {len(reader.pages)} pages. "
+                   f"For full text use run_python with pypdf on that path.]\n\n"
+                   f"{text[:8000]}")
+        except Exception as e:
+            out = f"[PDF saved to {saved} but extraction failed: {e}]"
         _seen[url] = out
         return out
 
+    # --- binary spreadsheets ---
+    if any(k in ctype for k in ("excel", "spreadsheet", "officedocument")) \
+            or name.lower().endswith((".xls", ".xlsx")):
+        out = (f"[Excel file saved to {saved}. Use run_python with "
+               f"pandas.read_excel('{saved}', sheet_name=None) to inspect.]")
+        _seen[url] = out
+        return out
+
+    # --- text-ish data files ---
+    if "html" not in ctype:
+        try:
+            preview = body.decode("utf-8", errors="replace")[:8000]
+        except Exception:
+            preview = "(undecodable binary)"
+        out = f"[Saved to {saved}]\n\n{preview}"
+        _seen[url] = out
+        return out
+
+    # --- HTML ---
     soup = BeautifulSoup(r.text, "lxml")
     for t in soup(["script", "style", "noscript"]):
         t.decompose()
@@ -55,7 +94,7 @@ def fetch_url(url: str) -> str:
         links = [a.get("href") for a in soup.find_all("a", href=True)][:30]
         out = ("EMPTY_PAGE: JavaScript-rendered page with no static content. "
                "Fetching more paths on this domain will NOT work. Use "
-               "web_search to find a direct data file (.csv/.xlsx/.json) or "
+               "web_search to find a direct data file (.csv/.xlsx/.pdf) or "
                f"another source. Links found: {links}")
     else:
         out = text[:8000]
@@ -63,7 +102,6 @@ def fetch_url(url: str) -> str:
     _seen[url] = out
     return out
 
-TAVILY_KEY = os.environ.get("TAVILY_KEY", "")
 
 def web_search(query: str) -> str:
     if TAVILY_KEY:
@@ -71,16 +109,14 @@ def web_search(query: str) -> str:
             r = httpx.post("https://api.tavily.com/search", timeout=30, json={
                 "api_key": TAVILY_KEY, "query": query,
                 "max_results": 8, "search_depth": "basic"})
-            data = r.json()
             rows = [f"{x.get('title','')} | {x.get('url','')} | "
                     f"{(x.get('content') or '')[:300]}"
-                    for x in data.get("results", [])]
+                    for x in r.json().get("results", [])]
             if rows:
                 return "\n".join(rows)
         except Exception as e:
             return f"ERROR (tavily): {e}"
 
-    # fallback: DDG lite - often blocked from cloud IPs
     try:
         r = httpx.post("https://lite.duckduckgo.com/lite/", data={"q": query},
                        timeout=20, headers={"User-Agent": "Mozilla/5.0"})
@@ -93,12 +129,13 @@ def web_search(query: str) -> str:
 
 
 def run_python(code: str) -> str:
-    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
+                                     dir=str(WORKDIR)) as f:
         f.write(code)
         path = f.name
     try:
-        p = subprocess.run(["python", path], capture_output=True,
-                           text=True, timeout=60)
+        p = subprocess.run(["python", path], capture_output=True, text=True,
+                           timeout=60, cwd=str(WORKDIR))
         return (p.stdout + p.stderr)[:20000] or "(no output)"
     except subprocess.TimeoutExpired:
         return "ERROR: timed out after 60s"
@@ -119,14 +156,16 @@ TOOLS = [
                        "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "fetch_url",
-        "description": ("HTTP GET a URL. HTML is stripped to text. "
-                        "CSV/JSON returned raw."),
+        "description": ("HTTP GET a URL. HTML is stripped to text, PDFs are "
+                        "text-extracted, and every file is saved to /tmp/work/ "
+                        "for use with run_python."),
         "parameters": {"type": "object",
                        "properties": {"url": {"type": "string"}},
                        "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "run_python",
-        "description": ("Run Python 3. pandas, httpx, bs4, lxml available. "
+        "description": ("Run Python 3 in /tmp/work. pandas, numpy, pypdf, "
+                        "openpyxl, httpx, requests, bs4, lxml available. "
                         "Print results to stdout. 60s timeout."),
         "parameters": {"type": "object",
                        "properties": {"code": {"type": "string"}},
@@ -162,17 +201,27 @@ SYSTEM = textwrap.dedent("""
     Example: asked for {"answer": {"state": "<name>"}, "log_url": "..."}
     you output exactly: {"state": "Kerala"}
 
+    ENVIRONMENT:
+    - Every file you fetch is saved to /tmp/work/<filename>. Use that exact
+      path in run_python. NEVER invent paths like /mnt/data/.
+    - run_python executes with /tmp/work as the working directory.
+    - Installed: pandas, numpy, pypdf, openpyxl, httpx, requests, bs4, lxml.
+    - NOT installed: fitz/PyMuPDF, PyPDF2, tabula, camelot. Use pypdf.
+    - Extract PDF text like this:
+        from pypdf import PdfReader
+        text = "\\n".join(p.extract_text() or "" for p in PdfReader(path).pages)
+
     METHOD:
     - Start from the search results provided to you. Use web_search again
       if they are not useful.
-    - Prefer direct .csv / .xlsx / .json files over landing pages.
+    - Prefer direct .csv / .xlsx / .pdf files over landing pages.
     - Many Indian government sites (mospi.gov.in, niti.gov.in) are
       JavaScript SPAs returning an empty shell. If fetch_url returns
       EMPTY_PAGE, do NOT try more paths on that domain.
     - Never fetch the same URL twice. If it failed, change source.
     - Use run_python for ALL computation. Never do arithmetic mentally.
-    - If the question embeds the data inline, skip searching entirely and
-      go straight to run_python.
+    - If the question embeds the data inline, skip searching and go
+      straight to run_python.
     - If you cannot find real data, still return a best-effort answer in
       the required shape, but first call run_python to print what you
       tried, so the log records your reasoning.
@@ -182,7 +231,6 @@ SYSTEM = textwrap.dedent("""
 
 
 def solve(history: list, run_id: str):
-
     _seen.clear()
     log = []
     question = history[-1]["content"]
@@ -195,15 +243,13 @@ def solve(history: list, run_id: str):
                   "content": f"Search results that may help:\n{hits}\n\n"
                              "Use these before inventing URLs."}])
 
-    m = None
-
-    dead_search = hits.startswith("ERROR")
-    if dead_search:
+    if hits.startswith("ERROR"):
         messages.append({"role": "user", "content":
             "NOTE: web search is unavailable. Do not call web_search. "
             "Go directly to fetch_url on likely data URLs, or answer from "
             "your own knowledge if no data is reachable."})
-    
+
+    m = None
     for i in range(MAX_STEPS):
         r = client.chat.completions.create(
             model=MODEL, messages=messages, tools=TOOLS, temperature=0)
@@ -244,7 +290,7 @@ def solve(history: list, run_id: str):
         answer = raw
 
     while (isinstance(answer, dict) and "answer" in answer
-       and set(answer.keys()) <= {"answer", "log_url"}):
+           and set(answer.keys()) <= {"answer", "log_url"}):
         answer = answer["answer"]
 
     log.append({"step": "final", "answer": answer})
@@ -253,5 +299,3 @@ def solve(history: list, run_id: str):
     except Exception as e:
         log.append({"commit_error": str(e)})
     return answer
-
-
