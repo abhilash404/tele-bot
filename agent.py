@@ -131,14 +131,19 @@ def web_search(query: str) -> str:
 def run_python(code: str) -> str:
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
                                      dir=str(WORKDIR)) as f:
-        f.write(code)
+        f.write(_autoprint(code))
         path = f.name
     try:
         p = subprocess.run(["python", path], capture_output=True, text=True,
-                           timeout=60, cwd=str(WORKDIR))
-        return (p.stdout + p.stderr)[:20000] or "(no output)"
+                           timeout=120, cwd=str(WORKDIR))
+        out = (p.stdout + p.stderr)[:20000]
+        if not out.strip():
+            return ("(no output - the script ran but printed nothing. "
+                    "run_python is a SCRIPT, not a notebook: use print().)")
+        return out
     except subprocess.TimeoutExpired:
-        return "ERROR: timed out after 60s"
+        return ("ERROR: timed out after 120s. Narrow the work - parse fewer "
+                "PDF pages, or read only the columns you need.")
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -210,6 +215,9 @@ SYSTEM = textwrap.dedent("""
     - Extract PDF text like this:
         from pypdf import PdfReader
         text = "\\n".join(p.extract_text() or "" for p in PdfReader(path).pages)
+    - run_python is a SCRIPT, not a notebook. Always print() what you want
+      to see. Large PDFs can take 60s+ to parse - extract only the pages
+      you need.
 
     METHOD:
     - Start from the search results provided to you. Use web_search again
@@ -228,6 +236,24 @@ SYSTEM = textwrap.dedent("""
 
     Output only the answer value. No prose, no markdown fences.
 """).strip()
+
+
+import ast
+
+def _autoprint(code: str) -> str:
+    """Wrap a trailing bare expression in print(), REPL-style."""
+    try:
+        tree = ast.parse(code)
+        if tree.body and isinstance(tree.body[-1], ast.Expr):
+            last = tree.body[-1]
+            tree.body[-1] = ast.Expr(
+                value=ast.Call(func=ast.Name(id="print", ctx=ast.Load()),
+                               args=[last.value], keywords=[]))
+            ast.fix_missing_locations(tree)
+            return ast.unparse(tree)
+    except Exception:
+        pass
+    return code
 
 
 def solve(history: list, run_id: str):
