@@ -1,5 +1,7 @@
 import os, json, base64, subprocess, tempfile, textwrap, httpx
 from openai import OpenAI
+from bs4 import BeautifulSoup
+
 
 client = OpenAI(
     api_key=os.environ["LLM_API_KEY"],
@@ -29,7 +31,40 @@ def fetch_url(url: str) -> str:
     try:
         r = httpx.get(url, timeout=45, follow_redirects=True,
                       headers={"User-Agent": "Mozilla/5.0"})
-        return r.text[:20000]
+    except Exception as e:
+        return f"ERROR: {e}"
+
+    ctype = r.headers.get("content-type", "")
+    if "html" not in ctype:
+        return r.text[:8000]          # csv/json/xml - return raw
+
+    soup = BeautifulSoup(r.text, "lxml")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    text = " ".join(soup.get_text(" ").split())
+
+    if len(text) < 300:
+        links = [a.get("href") for a in soup.find_all("a", href=True)][:30]
+        return ("EMPTY_PAGE: This is a JavaScript-rendered page with no static "
+                "content. Fetching more paths on this site will NOT work. "
+                "Use web_search to find a direct data file (.csv/.xlsx/.json) "
+                f"or an alternative source. Links found: {links}")
+    return text[:8000]
+
+def web_search(query: str) -> str:
+    try:
+        r = httpx.post("https://html.duckduckgo.com/html/",
+                       data={"q": query}, timeout=30,
+                       headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "lxml")
+        out = []
+        for res in soup.select(".result")[:8]:
+            a = res.select_one(".result__a")
+            s = res.select_one(".result__snippet")
+            if a:
+                out.append(f"{a.get_text()} | {a.get('href')} | "
+                           f"{s.get_text() if s else ''}")
+        return "\n".join(out) or "No results."
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -60,10 +95,28 @@ def commit_log(run_id: str, lines: list) -> None:
 
 
 SYSTEM = textwrap.dedent("""
-    You are a data analyst. Answer the user's final question using the tools.
-    Prefer run_python for any computation; never do arithmetic in your head.
-    When you have the answer, reply with ONLY the JSON value the question
-    asked for - no prose, no markdown fences, no explanation.
+    You are a data analyst agent.
+
+    OUTPUT CONTRACT (critical):
+    The user's message shows a JSON template containing "answer" and
+    "log_url" keys. You must output ONLY the value that belongs inside
+    "answer". Never output the outer object. Never output a log_url -
+    that is filled in by the system.
+    Example: if asked for {"answer": {"state": "<name>"}, "log_url": "..."}
+    you output exactly: {"state": "Kerala"}
+
+    METHOD:
+    - Use web_search first to locate a real data source. Prefer direct
+      .csv / .xlsx / .json files and government PDFs over landing pages.
+    - Many government sites (including mospi.gov.in) are JavaScript SPAs
+      that return an empty shell. If fetch_url returns EMPTY_PAGE, do NOT
+      try more paths on that domain - search for the data file instead.
+    - Use run_python for ALL computation. Never do arithmetic mentally.
+    - If after your attempts you cannot find real data, still return a
+      best-effort answer in the required shape, but call run_python once
+      to print your reasoning so the log records what you tried.
+
+    Output only the answer value. No prose, no markdown fences.
 """).strip()
 
 
@@ -102,6 +155,9 @@ def solve(history: list, run_id: str) -> tuple:
         answer = json.loads(raw)
     except Exception:
         answer = raw
+
+    if isinstance(answer, dict) and "log_url" in answer and "answer" in answer:
+        answer = answer["answer"]
 
     log.append({"step": "final", "answer": answer})
     try:
